@@ -1,0 +1,293 @@
+name: Turnstile Solver
+
+on:
+  workflow_dispatch:
+    inputs:
+      sitekey:
+        description: "Cloudflare Turnstile sitekey"
+        required: true
+      domain:
+        description: "Target domain (e.g. example.com)"
+        required: true
+      browser_count:
+        description: "Number of Chrome instances"
+        required: false
+        default: "5"
+
+jobs:
+  solve:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Rust ───────────────────────────────────────────────────────────────
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            cf-turnstile-bypass/token-server
+            cf-turnstile-bypass/turnstile-clicker
+            cf-turnstile-bypass/z-index-orderer
+            cf-turnstile-bypass/browser_launcher
+
+      - name: Build Rust binaries
+        shell: pwsh
+        run: |
+          cd cf-turnstile-bypass/token-server;    cargo build --release
+          cd ../turnstile-clicker;                cargo build --release
+          cd ../z-index-orderer;                  cargo build --release
+          cd ../browser_launcher;                 cargo build --release
+
+      # ── 3. Node.js ────────────────────────────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install API server deps
+        shell: pwsh
+        run: cd api-server; npm install
+
+      # ── 4. Configure extension ────────────────────────────────────────────────
+      - name: Configure extension
+        shell: pwsh
+        env:
+          SITEKEY: ${{ github.event.inputs.sitekey }}
+          WORKSPACE: ${{ github.workspace }}
+        run: powershell -File scripts/configure-extension.ps1
+
+      # ── 5. Install cloudflared ────────────────────────────────────────────────
+      - name: Install cloudflared
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+            -OutFile "cloudflared.exe"
+
+      # ── 6. Start token server ─────────────────────────────────────────────────
+      # BUG FIX #1: PORT is const PORT: u16 = 8080 in src — no CLI arg, always :8080
+      - name: Start token server
+        shell: pwsh
+        run: |
+          $log = "$env:GITHUB_WORKSPACE\token-server.log"
+          $proc = Start-Process `
+            -FilePath "cf-turnstile-bypass\token-server\target\release\token-server.exe" `
+            -RedirectStandardOutput $log `
+            -PassThru -WindowStyle Hidden
+          $proc.Id | Out-File "token-server.pid"
+
+          # Wait for "WebSocket server listening on ws://localhost:8080" (actual msg from main.rs)
+          $ready = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 1
+            if ((Get-Content $log -Raw -EA SilentlyContinue) -match "WebSocket server listening") {
+              $ready = $true; break
+            }
+          }
+          if (-not $ready) { Write-Error "Token server failed to start"; exit 1 }
+          Write-Host "[OK] Token server up on :8080"
+
+      # ── 7. Start API server ───────────────────────────────────────────────────
+      # BUG FIX #1 (cont): TOKEN_SERVER_HOST = ws://localhost:8080, API on :3000
+      - name: Start API server
+        shell: pwsh
+        env:
+          API_KEY: ${{ secrets.SOLVER_API_KEY }}
+          SITEKEY: ${{ github.event.inputs.sitekey }}
+          DOMAIN: ${{ github.event.inputs.domain }}
+          TOKEN_SERVER_HOST: "ws://localhost:8080"
+          PORT: "3000"
+        run: |
+          $proc = Start-Process -FilePath "node" `
+            -ArgumentList "api-server/index.js" `
+            -RedirectStandardOutput "$env:GITHUB_WORKSPACE\api-server.log" `
+            -PassThru -WindowStyle Hidden
+          $proc.Id | Out-File "api-server.pid"
+          Start-Sleep -Seconds 2
+          Write-Host "[OK] API server up on :3000"
+
+      # ── 8. Cloudflare Tunnel ──────────────────────────────────────────────────
+      - name: Start Cloudflare tunnel & notify
+        shell: pwsh
+        env:
+          NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          NOTIFY_SECRET: ${{ secrets.NOTIFY_SECRET }}
+        run: |
+          $proc = Start-Process -FilePath ".\cloudflared.exe" `
+            -ArgumentList "tunnel", "--url", "http://localhost:3000", "--no-autoupdate" `
+            -RedirectStandardError "tunnel.log" `
+            -PassThru -WindowStyle Hidden
+          $proc.Id | Out-File "tunnel.pid"
+
+          $tunnelUrl = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            if ((Get-Content "tunnel.log" -Raw -EA SilentlyContinue) -match `
+              'https://[a-zA-Z0-9\-]+\.trycloudflare\.com') {
+              $tunnelUrl = $Matches[0]; break
+            }
+          }
+          if (-not $tunnelUrl) { Write-Error "Tunnel URL not found"; exit 1 }
+          Write-Host "[OK] Tunnel: $tunnelUrl"
+          $tunnelUrl | Out-File "tunnel-url.txt"
+
+          # If no NOTIFY_WEBHOOK set → tunnel itself is the API, just log it
+          if ($env:NOTIFY_WEBHOOK) {
+            node scripts/notify-tunnel.js "$tunnelUrl"
+          } else {
+            Write-Host ""
+            Write-Host "========================================"
+            Write-Host " No NOTIFY_WEBHOOK set."
+            Write-Host " Tunnel is your API — use it directly:"
+            Write-Host " $tunnelUrl/solve-turnstile"
+            Write-Host " $tunnelUrl/health"
+            Write-Host "========================================"
+          }
+
+      # ── 9. Generate browser profiles ──────────────────────────────────────────
+      # find_browsers writes browser_binaries.txt + browser_profiles/ relative to its CWD
+      - name: Generate browser profiles
+        shell: pwsh
+        env:
+          BROWSER_COUNT: ${{ github.event.inputs.browser_count }}
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          $extDir = "$env:WORKSPACE\cf-turnstile-bypass\proxy-extensions\cdp"
+          $count  = $env:BROWSER_COUNT
+          Set-Location "cf-turnstile-bypass\browser_launcher"
+          $proc = Start-Process `
+            -FilePath "target\release\find_browsers.exe" `
+            -ArgumentList "chrome", $count, "`"$extDir`"" `
+            -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) { Write-Error "find_browsers failed"; exit 1 }
+          Write-Host "[OK] browser_binaries.txt:"
+          Get-Content ".\browser_binaries.txt"
+
+      # ── 10. Start Turnstile Clicker ───────────────────────────────────────────
+      # BUG FIX #6 (startup order): clicker must start BEFORE browsers so its hook
+      # is registered before any checkbox can appear. Per README step order:
+      # find_browsers -> token server -> clicker -> z-orderer -> browsers -> F8 -> F9/F7
+      # BUG FIX #3: poll stdout for exact startup message, not sleep
+      - name: Start Turnstile Clicker
+        shell: pwsh
+        run: |
+          $log = "$env:GITHUB_WORKSPACE\clicker.log"
+          $proc = Start-Process `
+            -FilePath "cf-turnstile-bypass\turnstile-clicker\target\release\turnstile-clicker.exe" `
+            -RedirectStandardOutput $log `
+            -PassThru
+          $proc.Id | Out-File "clicker.pid"
+
+          # Poll for "Press F8 to activate the auto-clicker." (exact message in clicker main.rs)
+          # Do NOT press F8 yet — browsers aren't loaded, pressing now = no-op risk
+          $ready = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 1
+            if ((Get-Content $log -Raw -EA SilentlyContinue) -match "Press F8 to activate") {
+              $ready = $true; break
+            }
+          }
+          if (-not $ready) { Write-Warning "Clicker ready message not seen — continuing" }
+          Write-Host "[OK] Clicker process ready (F8 not pressed yet — waiting for browsers)"
+
+      # ── 11. Start Z-index Orderer ─────────────────────────────────────────────
+      # BUG FIX #6 (startup order): z-orderer must start BEFORE browsers.
+      # It snapshots pre-existing windows on startup — any window that opens AFTER
+      # this point gets tracked and assigned a z-order. If started after browsers,
+      # those browser windows would be in the pre-existing snapshot and never tracked.
+      # BUG FIX #3: poll stdout for exact startup message
+      - name: Start Z-index Orderer
+        shell: pwsh
+        run: |
+          $log = "$env:GITHUB_WORKSPACE\zorderer.log"
+          $proc = Start-Process `
+            -FilePath "cf-turnstile-bypass\z-index-orderer\target\release\z-index-orderer.exe" `
+            -RedirectStandardOutput $log `
+            -PassThru
+          $proc.Id | Out-File "zorderer.pid"
+
+          # Poll for "Press F7 to de-activate..." (exact message in z-index-orderer main.rs)
+          # F9 and F7 are pressed AFTER browsers finish loading — not here
+          $ready = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 1
+            if ((Get-Content $log -Raw -EA SilentlyContinue) -match "Press F7 to de-activate") {
+              $ready = $true; break
+            }
+          }
+          if (-not $ready) { Write-Warning "Z-orderer ready message not seen — continuing" }
+          Write-Host "[OK] Z-orderer running (new-page checker ON, enforcer OFF — waiting for browsers)"
+
+      # ── 12. Launch browsers ───────────────────────────────────────────────────
+      # BUG FIX #2: main.rs loops forever — must be backgrounded, never -Wait.
+      # BUG FIX #6: browsers launch HERE, after clicker+zorderer are already running.
+      # Z-orderer tracks each new Chrome window as it appears.
+      # main.rs must run from browser_launcher dir (reads ./browser_binaries.txt).
+      - name: Launch browsers
+        shell: pwsh
+        env:
+          BROWSER_COUNT: ${{ github.event.inputs.browser_count }}
+          DOMAIN: ${{ github.event.inputs.domain }}
+        run: |
+          $count  = [int]$env:BROWSER_COUNT
+          $domain = $env:DOMAIN
+          Set-Location "cf-turnstile-bypass\browser_launcher"
+
+          # args: url width height spacing_x spacing_y [keys...]
+          $argList = @("https://$domain", "280", "490", "300", "510") + `
+                     (1..$count | ForEach-Object { "chrome$_" })
+
+          $proc = Start-Process `
+            -FilePath "target\release\main.exe" `
+            -ArgumentList $argList `
+            -PassThru   # background — loops forever by design
+          $proc.Id | Out-File "$env:GITHUB_WORKSPACE\browser-launcher.pid"
+          Write-Host "[OK] browser_launcher PID $($proc.Id) — spawning $count Chrome(s)"
+
+          # Give browsers time to fully load and register with token server
+          Write-Host "Waiting 10s for browsers to register with token server..."
+          Start-Sleep -Seconds 10
+
+      # ── 13. Enable clicker & z-orderer ───────────────────────────────────────
+      # BUG FIX #6: F8/F9/F7 pressed HERE — after all browsers are loaded and
+      # registered. This matches README "Starting It Up" step 6: press F8 after browsers.
+      # Order: F8 (enable clicker) → F9 (enable z-enforcer) → F7 (stop new-page checker)
+      - name: Enable clicker and z-orderer
+        shell: pwsh
+        run: |
+          $scripts = "$env:GITHUB_WORKSPACE\scripts"
+          powershell -File "$scripts\send-key.ps1" -Key "F8"   # enable auto-clicker
+          Start-Sleep -Milliseconds 500
+          powershell -File "$scripts\send-key.ps1" -Key "F9"   # enable z-order enforcer
+          Start-Sleep -Milliseconds 500
+          powershell -File "$scripts\send-key.ps1" -Key "F7"   # disable new-page checker (all browsers loaded)
+          Write-Host "[OK] F8 (clicker ON), F9 (z-enforcer ON), F7 (page checker OFF)"
+
+      # ── 14. Keep alive ────────────────────────────────────────────────────────
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          $url = Get-Content "$env:GITHUB_WORKSPACE\tunnel-url.txt"
+          Write-Host "============================================"
+          Write-Host " API endpoint : $url/solve-turnstile"
+          Write-Host " Health check : $url/health"
+          Write-Host "============================================"
+
+          $endTime = (Get-Date).AddMinutes(330)
+          while ((Get-Date) -lt $endTime) {
+            Start-Sleep -Seconds 60
+            try {
+              $r = Invoke-WebRequest -Uri "http://localhost:3000/health" -TimeoutSec 5 -EA Stop
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Health OK — $($r.Content)"
+            } catch {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Health FAIL: $_"
+            }
+          }
+          Write-Host "Workflow ending (330min cap). Restart via GitHub API."
