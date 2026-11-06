@@ -47,6 +47,6 @@ $verify = Get-Content $bgJsPath -Raw
 if ($verify -match [regex]::Escape($harvesterPath.Replace('\', '\\'))) {
     Write-Host "[Setup] Patch verified OK"
 } else {
-    Write-Error "[Setup] Patch verification FAILED - check background.js format"
+    Write-Error "[Setup] Patch verification FAILED — check background.js format"
     exit 1
 }
